@@ -25,3 +25,5 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/os-release:/host/etc/os-release:ro
+      - /var/log:/host/var/log:ro
+      - /var/lib/update-notifier:/host/var/lib/update-notifier:ro

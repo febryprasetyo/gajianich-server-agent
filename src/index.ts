@@ -952,6 +952,153 @@ async function executeSafeCommand(cmd: PendingCommand): Promise<CommandResult> {
   }
 }
 
+async function collectAuthSecurityMetrics(): Promise<{
+  successfulSshLogins: number;
+  failedSshAttempts: number;
+  sudoExecutions: number;
+  userAccountChanges: number;
+}> {
+  const possiblePaths = ['/host/var/log/auth.log', '/var/log/auth.log'];
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+      try {
+        const content = fs.readFileSync(p, 'utf8');
+        let successfulSshLogins = 0;
+        let failedSshAttempts = 0;
+        let sudoExecutions = 0;
+        let userAccountChanges = 0;
+        for (const line of content.split('\n')) {
+          if (line.includes('Accepted ')) successfulSshLogins++;
+          if (line.includes('Failed password') || line.includes('Failed publickey')) failedSshAttempts++;
+          if (line.includes('COMMAND=')) sudoExecutions++;
+          if (/useradd|userdel|usermod|groupadd/.test(line)) userAccountChanges++;
+        }
+        return { successfulSshLogins, failedSshAttempts, sudoExecutions, userAccountChanges };
+      } catch {
+        // fallback
+      }
+    }
+  }
+  try {
+    const [successOut, failOut, sudoOut, userOut] = await Promise.all([
+      safeHostExec('grep', ['-c', 'Accepted ', '/var/log/auth.log']),
+      safeHostExec('grep', ['-c', 'Failed password', '/var/log/auth.log']),
+      safeHostExec('grep', ['-c', 'COMMAND=', '/var/log/auth.log']),
+      safeHostExec('grep', ['-c', '-E', 'useradd|userdel|usermod|groupadd', '/var/log/auth.log']),
+    ]);
+    return {
+      successfulSshLogins: Number(successOut) || 0,
+      failedSshAttempts: Number(failOut) || 0,
+      sudoExecutions: Number(sudoOut) || 0,
+      userAccountChanges: Number(userOut) || 0,
+    };
+  } catch {
+    return {
+      successfulSshLogins: 0,
+      failedSshAttempts: 0,
+      sudoExecutions: 0,
+      userAccountChanges: 0,
+    };
+  }
+}
+
+function collectSystemPackageMetrics(): { total: number; security: number } {
+  const possiblePaths = [
+    '/host/var/lib/update-notifier/updates-available',
+    '/var/lib/update-notifier/updates-available',
+  ];
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+      try {
+        const text = fs.readFileSync(p, 'utf8');
+        const totalMatch = text.match(/(\d+)\s+updates?\s+can\s+be\s+applied/i);
+        const secMatch =
+          text.match(/(\d+)\s+of\s+these\s+updates\s+is\s+a\s+standard\s+security\s+update/i) ||
+          text.match(/(\d+)\s+additional\s+security\s+updates/i);
+        return {
+          total: totalMatch ? Number(totalMatch[1]) : 0,
+          security: secMatch ? Number(secMatch[1]) : 0,
+        };
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return { total: 0, security: 0 };
+}
+
+async function collectDatabaseMiddlewareMetrics(dockerServices: UnifiedService[]): Promise<{
+  postgres?: {
+    containerName: string;
+    activeConnections: number;
+    maxConnections: number;
+    poolUsagePct: number;
+    status: 'OPTIMAL' | 'WARNING' | 'CRITICAL';
+  };
+  redis?: {
+    containerName: string;
+    connectedClients: number;
+    usedMemoryHuman: string;
+    status: 'OPTIMAL' | 'WARNING' | 'CRITICAL';
+  };
+}> {
+  const result: any = {};
+
+  const pgService = dockerServices.find((s) => s.name.includes('postgres') || s.name.includes('db'));
+  if (pgService) {
+    try {
+      const pgOut = await safeExec('docker', [
+        'exec',
+        pgService.name,
+        'psql',
+        '-U',
+        'postgres',
+        '-t',
+        '-A',
+        '-c',
+        "SELECT count(*), (SELECT setting FROM pg_settings WHERE name='max_connections') FROM pg_stat_activity;",
+      ]);
+      if (pgOut && pgOut.includes('|')) {
+        const [activeStr, maxStr] = pgOut.trim().split('|');
+        const activeConnections = Number(activeStr) || 0;
+        const maxConnections = Number(maxStr) || 100;
+        const poolUsagePct = Number(((activeConnections / maxConnections) * 100).toFixed(1));
+        result.postgres = {
+          containerName: pgService.name,
+          activeConnections,
+          maxConnections,
+          poolUsagePct,
+          status: poolUsagePct > 85 ? 'CRITICAL' : poolUsagePct > 70 ? 'WARNING' : 'OPTIMAL',
+        };
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const redisService = dockerServices.find((s) => s.name.includes('redis'));
+  if (redisService) {
+    try {
+      const clientsOut = await safeExec('docker', ['exec', redisService.name, 'redis-cli', 'info', 'clients']);
+      const memOut = await safeExec('docker', ['exec', redisService.name, 'redis-cli', 'info', 'memory']);
+      const clientMatch = clientsOut.match(/connected_clients:(\d+)/);
+      const memMatch = memOut.match(/used_memory_human:([^\r\n]+)/);
+      const connectedClients = clientMatch ? Number(clientMatch[1]) : 0;
+      const usedMemoryHuman = memMatch ? memMatch[1].trim() : '0B';
+      result.redis = {
+        containerName: redisService.name,
+        connectedClients,
+        usedMemoryHuman,
+        status: connectedClients > 500 ? 'WARNING' : 'OPTIMAL',
+      };
+    } catch {
+      // ignore
+    }
+  }
+
+  return result;
+}
+
 async function collectAndPush(): Promise<void> {
   const pushStartMs = performance.now();
   const cpus = os.cpus();
@@ -964,11 +1111,15 @@ async function collectAndPush(): Promise<void> {
   const memMetrics = readLinuxMemory();
   const diskMetrics = await readLinuxDiskMetrics();
   const netMetrics = readLinuxNetworkMetrics();
-  const [pm2Services, { dockerServices, dbServices }, sysServices] = await Promise.all([
+  const [pm2Services, { dockerServices, dbServices }, sysServices, authSecMetrics] = await Promise.all([
     collectPm2Processes(),
     collectDockerAndContainerDatabases(),
     collectSystemdServices(),
+    collectAuthSecurityMetrics(),
   ]);
+
+  const pkgUpdates = collectSystemPackageMetrics();
+  const dbMiddleware = await collectDatabaseMiddlewareMetrics(dockerServices);
 
   const dockerPortNameMap = new Map<number, string>();
   for (const dk of dockerServices) {
@@ -1057,8 +1208,13 @@ async function collectAndPush(): Promise<void> {
       sslDaysRemaining: 89,
       ufwStatus: sysServices.some((s) => s.name === 'ufw.service') ? 'UFW Active' : 'UFW Standby',
       fail2banBannedIps: 0,
-      failedSshCount: 0,
+      failedSshCount: authSecMetrics.failedSshAttempts,
+      successfulSshLogins: authSecMetrics.successfulSshLogins,
+      sudoExecutions: authSecMetrics.sudoExecutions,
+      userAccountChanges: authSecMetrics.userAccountChanges,
+      pendingUpdates: pkgUpdates,
     },
+    middleware: dbMiddleware,
     openPorts,
     services,
     logs: recentLogs,
