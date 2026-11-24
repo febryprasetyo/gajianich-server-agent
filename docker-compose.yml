@@ -11,7 +11,8 @@ services:
     env_file:
       - .env
     environment:
-      - GAJIANICH_HUB_URL=${GAJIANICH_HUB_URL:-http://127.0.0.1:5000/api/v1/infrastructure/agent/telemetry}
+      - GAJIANICH_HUB_URL=${GAJIANICH_HUB_URL:-https://gajianich.cahayamascemerlang.co.id/api/v1/infrastructure/agent/telemetry}
+      - GAJIANICH_DEV_HUB_URL=${GAJIANICH_DEV_HUB_URL:-http://127.0.0.1:5000/api/v1/infrastructure/agent/telemetry}
       - AGENT_API_KEY=${AGENT_API_KEY}
       - AGENT_HOSTNAME=${AGENT_HOSTNAME:-fastpec-MINI-S}
       - AGENT_DISPLAY_NAME=${AGENT_DISPLAY_NAME:-fastpec-MINI-S (Local Host Server)}

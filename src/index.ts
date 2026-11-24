@@ -6,9 +6,56 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
-const HUB_URL = (
+function loadEnvFile() {
+  const possiblePaths = [
+    path.resolve(process.cwd(), '.env'),
+    path.resolve(__dirname, '../.env'),
+    path.resolve(__dirname, '.env'),
+  ];
+  for (const envPath of possiblePaths) {
+    if (fs.existsSync(envPath)) {
+      try {
+        const content = fs.readFileSync(envPath, 'utf8');
+        for (const rawLine of content.split('\n')) {
+          const trimmed = rawLine.trim();
+          if (!trimmed || trimmed.startsWith('#')) continue;
+          const eqIdx = trimmed.indexOf('=');
+          if (eqIdx > 0) {
+            const key = trimmed.slice(0, eqIdx).trim();
+            let val = trimmed.slice(eqIdx + 1).trim();
+            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+              val = val.slice(1, -1);
+            }
+            if (process.env[key] === undefined) {
+              process.env[key] = val;
+            }
+          }
+        }
+        break;
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+loadEnvFile();
+
+const PRIMARY_HUB_URL = (
   process.env.GAJIANICH_HUB_URL || 'http://127.0.0.1:5000/api/v1/infrastructure/agent/telemetry'
 ).trim();
+
+// Khusus server dev / ketika dikonfigurasi, kirim telemetri juga ke dev backend localhost
+const isDevServer = (process.env.AGENT_ENVIRONMENT || '').trim().toLowerCase() === 'dev';
+const DEV_HUB_URL = (
+  process.env.GAJIANICH_DEV_HUB_URL ||
+  (isDevServer ? 'http://127.0.0.1:5000/api/v1/infrastructure/agent/telemetry' : '')
+).trim();
+
+// Kumpulan endpoint tujuan telemetri: live prod + dev localhost
+const TARGET_HUB_URLS = Array.from(
+  new Set([PRIMARY_HUB_URL, DEV_HUB_URL].filter((u) => Boolean(u) && u.startsWith('http')))
+);
+
 const AGENT_KEY = (process.env.AGENT_API_KEY || '').trim();
 const HOSTNAME_OVERRIDE = (process.env.AGENT_HOSTNAME || os.hostname()).trim();
 const INTERVAL_MS = Math.max(3000, Number(process.env.AGENT_INTERVAL_MS) || 5000);
@@ -1018,31 +1065,33 @@ async function collectAndPush(): Promise<void> {
     commandResults: resultsToReport,
   };
 
-  try {
-    const response = await fetch(HUB_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Agent-Key': AGENT_KEY,
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(8000),
-    });
+  for (const hubUrl of TARGET_HUB_URLS) {
+    try {
+      const response = await fetch(hubUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Agent-Key': AGENT_KEY,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(8000),
+      });
 
-    if (response.ok) {
-      const body = (await response.json()) as { pendingCommands?: PendingCommand[] };
-      if (Array.isArray(body?.pendingCommands)) {
-        for (const cmd of body.pendingCommands) {
-          const res = await executeSafeCommand(cmd);
-          pendingResults.push(res);
+      if (response.ok) {
+        const body = (await response.json()) as { pendingCommands?: PendingCommand[] };
+        if (Array.isArray(body?.pendingCommands) && body.pendingCommands.length > 0) {
+          for (const cmd of body.pendingCommands) {
+            const res = await executeSafeCommand(cmd);
+            pendingResults.push(res);
+          }
         }
+      } else {
+        const errText = await response.text().catch(() => '');
+        console.error(`[Server360 Agent] Hub (${hubUrl}) returned HTTP ${response.status}: ${errText}`);
       }
-    } else {
-      const errText = await response.text().catch(() => '');
-      console.error(`[Server360 Agent] Hub returned HTTP ${response.status}: ${errText}`);
+    } catch (err: any) {
+      console.error(`[Server360 Agent] Push to ${hubUrl} failed: ${err?.message || err}`);
     }
-  } catch (err: any) {
-    console.error(`[Server360 Agent] Push failed: ${err?.message || err}`);
   }
 }
 
@@ -1051,7 +1100,7 @@ if (!AGENT_KEY) {
 }
 
 console.log(
-  `[Server360 Agent] Starting real-time Linux telemetry stream for host "${HOSTNAME_OVERRIDE}" -> ${HUB_URL} (${INTERVAL_MS}ms)`,
+  `[Server360 Agent] Starting real-time Linux telemetry stream for host "${HOSTNAME_OVERRIDE}" -> [${TARGET_HUB_URLS.join(', ')}] (${INTERVAL_MS}ms)`,
 );
 void collectAndPush();
 setInterval(() => {

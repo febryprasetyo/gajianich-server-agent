@@ -14,6 +14,8 @@ COPY package.json tsconfig.json ./
 RUN npm install
 
 COPY src ./src
+COPY scripts ./scripts
+RUN chmod +x scripts/*.sh 2>/dev/null || true
 RUN npm run build
 
 ENV NODE_ENV=production
