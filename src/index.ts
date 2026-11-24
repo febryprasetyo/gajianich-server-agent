@@ -1,5 +1,6 @@
 import os from 'node:os';
 import fs from 'node:fs';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -38,7 +39,7 @@ interface UnifiedService {
 
 interface PendingCommand {
   commandId: number;
-  actionType: 'restart' | 'reload' | 'logs' | 'ping';
+  actionType: 'restart' | 'reload' | 'logs' | 'ping' | 'update';
   targetId: string;
   targetName: string;
   category: string;
@@ -846,6 +847,23 @@ async function executeSafeCommand(cmd: PendingCommand): Promise<CommandResult> {
   }
 
   try {
+    if (cmd.actionType === 'update') {
+      const updateScript = path.resolve(__dirname, '../scripts/update.sh');
+      if (!fs.existsSync(updateScript)) {
+        return {
+          commandId: cmd.commandId,
+          status: 'FAILED',
+          outputText: `Update script not found at ${updateScript}`,
+        };
+      }
+      const out = await safeHostExec('bash', [updateScript], 120000);
+      return {
+        commandId: cmd.commandId,
+        status: 'SUCCESS',
+        outputText: out ? `Agent updated (${out})` : 'Agent update script completed successfully',
+      };
+    }
+
     if (cmd.actionType === 'restart' || cmd.actionType === 'reload') {
       if (cmd.category === 'docker' || cmd.targetId.startsWith('dk-') || cmd.targetId.startsWith('db-')) {
         const containerName = cmd.targetId.replace(/^(dk-|db-)/, '');
